@@ -1,12 +1,15 @@
 #pragma once
 
-// Qwen3-ForcedAligner: 给定音频与一串对齐单元,回每个单元的起止时刻。
+// Qwen3-ForcedAligner: given audio and a list of alignment units, return the start and end
+// time of every unit.
 //
-// 模型由两个 GGUF 组成:
-//   - LM    llama.cpp 的 `qwen3` 架构主干(0.6B)+ 词表
-//   - Audio clip 的 `qwen3a` 音频塔 + 多模态投影,另存 `score.weight`(时间桶头)
+// The model ships as two GGUF files:
+//   - LM     the qwen3 backbone (0.6B) plus its vocabulary
+//   - Audio  the qwen3a audio tower and multimodal projector, carrying the timestamp head
+//            (`score.weight`) as an extra tensor
 //
-// 单元怎么切由调用方决定,这里原样收下:逐字、逐词或任意粒度都行。
+// How the units are segmented is up to the caller; they are taken as given, so per-character,
+// per-word or any other granularity all work.
 
 #include <cstddef>
 #include <string>
@@ -17,36 +20,36 @@ struct qwen3_aligner;
 struct qwen3_aligner_params {
     std::string lm_path;
     std::string audio_path;
-    int         n_gpu_layers = -1;    // -1 = 全部卸载到 GPU
+    int         n_gpu_layers = -1;    // -1 offloads everything
     int         n_threads    = 4;
-    int         n_ctx        = 4096;  // 约 5 分钟音频
+    int         n_ctx        = 4096;  // about 5 minutes of audio
 };
 
-// 单元在音频里的位置,单位秒
+// Where a unit sits in the audio, in seconds
 struct qwen3_aligner_span {
     std::string text;
     double      start = 0.0;
     double      end   = 0.0;
 };
 
-// 失败回 nullptr 并填 err
+// Returns nullptr and fills err on failure
 qwen3_aligner * qwen3_aligner_init(const qwen3_aligner_params & params, std::string & err);
 
-// 容忍 nullptr
+// Accepts nullptr
 void qwen3_aligner_free(qwen3_aligner * ctx);
 
-// 模型要求的采样率(16000)
+// Sample rate the model expects (16000)
 int qwen3_aligner_sample_rate(const qwen3_aligner * ctx);
 
-// 把一段音频文件(wav/mp3/flac 等)解成单声道 16k float PCM
+// Decode an audio file (wav/mp3/flac) into mono float PCM at the model's sample rate
 bool qwen3_aligner_decode_audio(qwen3_aligner *      ctx,
                                 const void *         data,
                                 size_t               size,
                                 std::vector<float> & pcm,
                                 std::string &        err);
 
-// pcm 必须是 qwen3_aligner_sample_rate() 的单声道数据。
-// spans 与 units 一一对应,顺序一致。
+// pcm must be mono at qwen3_aligner_sample_rate().
+// spans comes back one per unit, in the same order.
 bool qwen3_aligner_align(qwen3_aligner *                        ctx,
                          const float *                          pcm,
                          size_t                                 n_samples,

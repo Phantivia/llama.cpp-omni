@@ -1,5 +1,5 @@
 #if defined(_WIN32)
-// miniaudio 会拉进 windows.h,不挡住 min/max 宏就和 std::max 撞车
+// miniaudio pulls in windows.h; without this its min/max macros collide with std::max
 #   define NOMINMAX
 #   define WIN32_LEAN_AND_MEAN
 #endif
@@ -12,7 +12,8 @@
 #include "ggml.h"
 #include "gguf.h"
 
-// 自带一份 miniaudio:mtmd-helper 里那份是 static 的,取不到,两份并存不冲突
+// Our own copy of miniaudio: the one in mtmd-helper is compiled with MA_API static, so its
+// symbols are not reachable from here. Two copies coexist without clashing.
 #define MINIAUDIO_IMPLEMENTATION
 #define MA_NO_ENCODING
 #define MA_NO_DEVICE_IO
@@ -34,23 +35,24 @@
 
 namespace {
 
-// 模型固定值;GGUF 里没有时用这些兜底
+// Model constants; used when the GGUF does not carry them
 constexpr int SAMPLE_RATE     = 16000;
 constexpr int DEF_SEGMENT_MS  = 80;
 constexpr int DEF_TS_TOKEN_ID = 151705;
 constexpr int DEF_N_BUCKETS   = 5000;
 
-// 每个单元后面跟两个时间戳槽,分别取起止
+// Two timestamp slots follow every unit: one for its start, one for its end
 constexpr const char * TS_PAIR = "<timestamp><timestamp>";
 
-/** 时间桶头:score.weight,ggml 序 [n_embd, n_buckets],即 n_buckets 行 × n_embd 列 */
+/** Timestamp head: score.weight, [n_embd, n_buckets] in ggml order, i.e. n_buckets rows of n_embd */
 struct score_head {
     std::vector<float> w;
     int n_buckets = 0;
     int n_embd    = 0;
 };
 
-/** 从音频 GGUF 里单独取出 score.weight 与三个 aligner.* 键。mtmd 不暴露任意张量,这里自己读。 */
+/** Read score.weight and the three aligner.* keys straight from the audio GGUF, since mtmd does
+ *  not expose arbitrary tensors. */
 bool load_score_head(const std::string & path,
                      score_head &        head,
                      int &               segment_ms,
@@ -61,7 +63,7 @@ bool load_score_head(const std::string & path,
 
     gguf_context * gguf = gguf_init_from_file(path.c_str(), gp);
     if (!gguf) {
-        err = "无法读取音频 GGUF: " + path;
+        err = "cannot read audio GGUF: " + path;
         return false;
     }
     std::unique_ptr<gguf_context, decltype(&gguf_free)> gguf_guard(gguf, gguf_free);
@@ -77,22 +79,22 @@ bool load_score_head(const std::string & path,
 
     const int64_t idx = gguf_find_tensor(gguf, "score.weight");
     if (idx < 0) {
-        err = "音频 GGUF 里没有 score.weight(时间桶头)";
+        err = "audio GGUF has no score.weight (timestamp head)";
         return false;
     }
     ggml_tensor * t = ggml_get_tensor(meta, "score.weight");
     if (!t) {
-        err = "score.weight 的元数据读不出来";
+        err = "cannot read the metadata of score.weight";
         return false;
     }
     if (t->type != GGML_TYPE_F32) {
-        err = "score.weight 不是 F32";
+        err = "score.weight is not F32";
         return false;
     }
     head.n_embd    = (int) t->ne[0];
     head.n_buckets = (int) t->ne[1];
     if (head.n_buckets != n_buckets_kv) {
-        err = "score.weight 的行数与 aligner.n_buckets 不符";
+        err = "score.weight row count does not match aligner.n_buckets";
         return false;
     }
 
@@ -101,24 +103,25 @@ bool load_score_head(const std::string & path,
 
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) {
-        err = "无法打开音频 GGUF: " + path;
+        err = "cannot open audio GGUF: " + path;
         return false;
     }
     head.w.resize(nbytes / sizeof(float));
     const bool ok = fseek(f, (long) offset, SEEK_SET) == 0 && fread(head.w.data(), 1, nbytes, f) == nbytes;
     fclose(f);
     if (!ok) {
-        err = "读 score.weight 的数据失败";
+        err = "failed to read the score.weight data";
         return false;
     }
     return true;
 }
 
 /**
- * 时间戳修补,与官方 Python 实现逐条对应。
+ * Timestamp repair, matching the reference implementation step for step.
  *
- * 先用最长非降子序列挑出「正常」的那批,剩下的按段修补:连着两个以内的取左右最近正常值里
- * 更靠近的一个,更长的段在左右之间线性插值,只有一侧有正常值时整段取那一侧。
+ * The longest non-decreasing subsequence marks the "sane" predictions. Runs of up to two
+ * outliers take whichever neighbouring sane value is closer; longer runs are interpolated
+ * between them; a run with sane values on only one side takes that side.
  */
 std::vector<int> fix_timestamps(const std::vector<double> & data) {
     const int n = (int) data.size();
@@ -199,7 +202,7 @@ struct qwen3_aligner {
     int n_ctx       = 0;
     int n_threads   = 4;
 
-    // 一份模型一次只服务一个请求
+    // One model serves one request at a time
     std::mutex mutex;
 
     ~qwen3_aligner() {
@@ -222,12 +225,12 @@ qwen3_aligner * qwen3_aligner_init(const qwen3_aligner_params & params, std::str
     mp.n_gpu_layers = params.n_gpu_layers;
     ctx->model = llama_model_load_from_file(params.lm_path.c_str(), mp);
     if (!ctx->model) {
-        err = "主干加载失败: " + params.lm_path;
+        err = "failed to load the backbone: " + params.lm_path;
         return nullptr;
     }
     ctx->n_embd_inp = llama_model_n_embd_inp(ctx->model);
     if (llama_model_n_embd(ctx->model) != ctx->head.n_embd) {
-        err = "主干的隐层宽度与时间桶头对不上";
+        err = "backbone hidden size does not match the timestamp head";
         return nullptr;
     }
 
@@ -237,11 +240,11 @@ qwen3_aligner * qwen3_aligner_init(const qwen3_aligner_params & params, std::str
     lp.n_ubatch        = ctx->n_ctx;
     lp.n_threads       = ctx->n_threads;
     lp.n_threads_batch = ctx->n_threads;
-    lp.embeddings      = true;                    // 要的是每个位置的隐状态,不是采样
+    lp.embeddings      = true;                    // we want per-position hidden states, not sampling
     lp.pooling_type    = LLAMA_POOLING_TYPE_NONE;
     ctx->lctx = llama_init_from_model(ctx->model, lp);
     if (!ctx->lctx) {
-        err = "主干上下文创建失败";
+        err = "failed to create the backbone context";
         return nullptr;
     }
 
@@ -252,15 +255,15 @@ qwen3_aligner * qwen3_aligner_init(const qwen3_aligner_params & params, std::str
     tp.warmup        = false;
     ctx->mctx = mtmd_init_from_file(params.audio_path.c_str(), ctx->model, tp);
     if (!ctx->mctx) {
-        err = "音频塔加载失败: " + params.audio_path;
+        err = "failed to load the audio tower: " + params.audio_path;
         return nullptr;
     }
     if (!mtmd_support_audio(ctx->mctx)) {
-        err = "这个 GGUF 里没有音频编码器";
+        err = "this GGUF has no audio encoder";
         return nullptr;
     }
     if (mtmd_decode_use_mrope(ctx->mctx)) {
-        err = "对齐器不支持 mrope 位置编码的模型";
+        err = "the aligner does not support models using mrope positions";
         return nullptr;
     }
 
@@ -285,7 +288,7 @@ bool qwen3_aligner_decode_audio(qwen3_aligner *      ctx,
                                 std::vector<float> & pcm,
                                 std::string &        err) {
     if (!data || size == 0) {
-        err = "音频数据为空";
+        err = "empty audio data";
         return false;
     }
     const int sr = qwen3_aligner_sample_rate(ctx);
@@ -293,14 +296,14 @@ bool qwen3_aligner_decode_audio(qwen3_aligner *      ctx,
     ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 1, sr);
     ma_decoder decoder;
     if (ma_decoder_init_memory(data, size, &cfg, &decoder) != MA_SUCCESS) {
-        err = "音频解码失败(支持 wav / mp3 / flac)";
+        err = "failed to decode the audio (wav / mp3 / flac are supported)";
         return false;
     }
 
     ma_uint64 n_frames = 0;
     if (ma_decoder_get_length_in_pcm_frames(&decoder, &n_frames) != MA_SUCCESS) {
         ma_decoder_uninit(&decoder);
-        err = "读不出音频长度";
+        err = "cannot determine the audio length";
         return false;
     }
 
@@ -309,7 +312,7 @@ bool qwen3_aligner_decode_audio(qwen3_aligner *      ctx,
     const bool ok = ma_decoder_read_pcm_frames(&decoder, pcm.data(), n_frames, &got) == MA_SUCCESS;
     ma_decoder_uninit(&decoder);
     if (!ok) {
-        err = "读音频帧失败";
+        err = "failed to read the audio frames";
         return false;
     }
     pcm.resize((size_t) got);
@@ -323,7 +326,7 @@ bool qwen3_aligner_align(qwen3_aligner *                   ctx,
                          std::vector<qwen3_aligner_span> & spans,
                          std::string &                     err) {
     if (!ctx) {
-        err = "对齐器未加载";
+        err = "aligner not loaded";
         return false;
     }
     spans.clear();
@@ -331,13 +334,13 @@ bool qwen3_aligner_align(qwen3_aligner *                   ctx,
         return true;
     }
     if (!pcm || n_samples == 0) {
-        err = "音频为空";
+        err = "empty audio";
         return false;
     }
 
     std::lock_guard<std::mutex> lock(ctx->mutex);
 
-    // ── 切块:音频 + 每个单元后两个时间戳槽 ────────────────────────────────
+    // ── chunks: the audio, then every unit followed by two timestamp slots ─────────────
 
     std::string text = mtmd_default_marker();
     for (const auto & unit : units) {
@@ -348,7 +351,7 @@ bool qwen3_aligner_align(qwen3_aligner *                   ctx,
     std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)> bitmap(
         mtmd_bitmap_init_from_audio(n_samples, pcm), mtmd_bitmap_free);
     if (!bitmap) {
-        err = "音频封装失败";
+        err = "failed to wrap the audio";
         return false;
     }
 
@@ -358,17 +361,17 @@ bool qwen3_aligner_align(qwen3_aligner *                   ctx,
     mtmd_input_text input {};
     input.text          = text.c_str();
     input.add_special   = false;
-    input.parse_special = true;   // <timestamp> 与 <|audio_start|> 都是词表里的标记
+    input.parse_special = true;   // <timestamp> and <|audio_start|> are vocabulary tokens
 
     const mtmd_bitmap * bitmaps[1] = { bitmap.get() };
     if (mtmd_tokenize(ctx->mctx, chunks.get(), &input, bitmaps, 1) != 0) {
-        err = "切块失败";
+        err = "tokenization failed";
         return false;
     }
 
     const size_t n_chunks = mtmd_input_chunks_size(chunks.get());
     if (n_chunks == 0) {
-        err = "切块结果为空";
+        err = "tokenization produced no chunks";
         return false;
     }
 
@@ -377,16 +380,16 @@ bool qwen3_aligner_align(qwen3_aligner *                   ctx,
         n_total += mtmd_input_chunk_get_n_tokens(mtmd_input_chunks_get(chunks.get(), i));
     }
     if ((int) n_total > ctx->n_ctx) {
-        err = "音频与文本超出对齐器上下文(" + std::to_string(n_total) + " > " + std::to_string(ctx->n_ctx) +
-              "),请加大 --aligner-ctx-size 或切短音频";
+        err = "audio and text exceed the aligner context (" + std::to_string(n_total) + " > " +
+              std::to_string(ctx->n_ctx) + "); raise --aligner-ctx-size or use shorter audio";
         return false;
     }
 
-    // ── 逐块解码,最后一块开隐状态输出 ─────────────────────────────────────
+    // ── decode chunk by chunk; only the last one needs hidden states ───────────────────
 
     llama_memory_clear(llama_get_memory(ctx->lctx), true);
     llama_pos n_past = 0;
-    std::vector<int> ts_positions; // 最后一块内的下标
+    std::vector<int> ts_positions; // indices inside the last chunk
 
     for (size_t i = 0; i < n_chunks; i++) {
         const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks.get(), i);
@@ -417,7 +420,7 @@ bool qwen3_aligner_align(qwen3_aligner *                   ctx,
             llama_batch_free(batch);
         } else {
             if (mtmd_encode_chunk(ctx->mctx, chunk) != 0) {
-                err = "音频编码失败";
+                err = "audio encoding failed";
                 return false;
             }
             const float * embd  = mtmd_get_output_embd(ctx->mctx);
@@ -440,26 +443,26 @@ bool qwen3_aligner_align(qwen3_aligner *                   ctx,
             llama_set_causal_attn(ctx->lctx, true);
         }
         if (rc != 0) {
-            err = "解码失败(块 " + std::to_string(i) + ")";
+            err = "decode failed (chunk " + std::to_string(i) + ")";
             return false;
         }
         n_past += mtmd_input_chunk_get_n_pos(chunk);
     }
 
     if (ts_positions.size() != units.size() * 2) {
-        err = "时间戳槽数量与单元数对不上(" + std::to_string(ts_positions.size()) + " vs " +
-              std::to_string(units.size() * 2) + "),检查单元里是否混入了标记文本";
+        err = "timestamp slot count does not match the unit count (" + std::to_string(ts_positions.size()) +
+              " vs " + std::to_string(units.size() * 2) + "); check the units for special markers";
         return false;
     }
 
-    // ── 时间桶头 ──────────────────────────────────────────────────────────
+    // ── timestamp head ─────────────────────────────────────────────────────────────────
 
     std::vector<double> ts_ms;
     ts_ms.reserve(ts_positions.size());
     for (int idx : ts_positions) {
         const float * h = llama_get_embeddings_ith(ctx->lctx, idx);
         if (!h) {
-            err = "取不到时间戳位置的隐状态";
+            err = "no hidden state at a timestamp position";
             return false;
         }
         int   best_bucket = 0;

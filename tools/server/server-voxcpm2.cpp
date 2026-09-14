@@ -174,7 +174,7 @@ static std::vector<float> voxcpm2_load_wav_from_memory(const std::vector<uint8_t
 
 struct voxcpm2_server_state {
     VoxCPM2Runtime * runtime = nullptr;
-    // 对齐器自带锁,不受 mutex 管;加载后只读
+    // the aligner has its own lock and is read-only once loaded, so it is outside this mutex
     qwen3_aligner * aligner = nullptr;
     std::mutex mutex;
 };
@@ -494,8 +494,8 @@ int main(int argc, char ** argv) {
 
     // ── POST /v1/audio/align ──────────────────────────────────────────────
     //
-    // 给一段音频和一串对齐单元,回每个单元的起止秒数。单元怎么切是调用方的事,
-    // 这里原样收下:中文逐字、英文逐词、或者任意别的粒度都行。
+    // Takes audio plus a list of alignment units and returns the start and end second of each
+    // unit. How the units are segmented is the caller's business; they are used as given.
 
     svr.Post("/v1/audio/align", [&](const httplib::Request & req, httplib::Response & res) {
         if (!state.aligner) {
@@ -585,7 +585,7 @@ int main(int argc, char ** argv) {
         std::string err;
         state.aligner = qwen3_aligner_init(ap, err);
         if (!state.aligner) {
-            // TTS 本身还能用,对齐端点返回未加载即可,不拖垮整个 server
+            // TTS itself still works; the align endpoint just reports "not loaded"
             LOG_ERR("aligner init failed: %s\n", err.c_str());
         } else {
             LOG_INF("Aligner loaded\n");

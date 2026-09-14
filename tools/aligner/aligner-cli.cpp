@@ -1,9 +1,9 @@
-// Qwen3-ForcedAligner 的冒烟工具:喂一个音频与一串单元,打印逐单元时间戳。
+// Smoke tool for Qwen3-ForcedAligner: feed it audio and a list of units, get per-unit timestamps.
 //
 //   llama-aligner-cli --aligner-lm LM.gguf --aligner-audio AUDIO.gguf \
-//                     -f speech.wav --units "大,家,好" [--ngl 99] [--ctx 4096] [--json]
+//                     -f speech.wav --units "a,b,c" [--ngl 99] [--ctx 4096] [--json]
 //
-// --units 是逗号分隔的单元表。切分规则由调用方决定,这里不做分词。
+// --units is comma separated. Segmentation is the caller's business; nothing is tokenized here.
 
 #include "qwen3-aligner.h"
 
@@ -18,12 +18,13 @@ namespace {
 
 void print_usage(const char * argv0) {
     fprintf(stderr,
-            "用法: %s --aligner-lm LM.gguf --aligner-audio AUDIO.gguf -f AUDIO.wav --units \"a,b,c\"\n"
-            "  --units-file F  从 UTF-8 文本读单元,一行一个(Windows 命令行传非 ASCII 会被代码页改写)\n"
-            "  --ngl N         卸载到 GPU 的层数(默认 -1,全部)\n"
-            "  --ctx N         上下文长度(默认 4096)\n"
-            "  --threads N     CPU 线程(默认 4)\n"
-            "  --json          输出 JSON\n",
+            "usage: %s --aligner-lm LM.gguf --aligner-audio AUDIO.gguf -f AUDIO.wav --units \"a,b,c\"\n"
+            "  --units-file F  read units from a UTF-8 file, one per line (Windows consoles\n"
+            "                  rewrite non-ASCII arguments through the active code page)\n"
+            "  --ngl N         layers to offload to the GPU (default: -1, all)\n"
+            "  --ctx N         context size (default: 4096)\n"
+            "  --threads N     CPU threads (default: 4)\n"
+            "  --json          print JSON\n",
             argv0);
 }
 
@@ -40,7 +41,7 @@ std::vector<std::string> split_units(const std::string & s) {
     return out;
 }
 
-/** 一行一个单元的 UTF-8 文本;空行跳过,行尾 \r 去掉 */
+/** One unit per line, UTF-8; blank lines skipped, trailing \r stripped */
 bool read_units_file(const std::string & path, std::vector<std::string> & units) {
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -86,7 +87,7 @@ int main(int argc, char ** argv) {
         const std::string a = argv[i];
         auto next = [&](const char * what) -> std::string {
             if (i + 1 >= argc) {
-                fprintf(stderr, "%s 缺参数\n", what);
+                fprintf(stderr, "%s needs a value\n", what);
                 exit(1);
             }
             return argv[++i];
@@ -102,7 +103,7 @@ int main(int argc, char ** argv) {
         else if (a == "--json")          as_json             = true;
         else if (a == "-h" || a == "--help") { print_usage(argv[0]); return 0; }
         else {
-            fprintf(stderr, "未知参数: %s\n", a.c_str());
+            fprintf(stderr, "unknown argument: %s\n", a.c_str());
             print_usage(argv[0]);
             return 1;
         }
@@ -117,14 +118,14 @@ int main(int argc, char ** argv) {
     std::vector<std::string> units;
     if (!units_file.empty()) {
         if (!read_units_file(units_file, units)) {
-            fprintf(stderr, "读不了单元文件: %s\n", units_file.c_str());
+            fprintf(stderr, "cannot read the units file: %s\n", units_file.c_str());
             return 1;
         }
     } else {
         units = split_units(units_arg);
     }
     if (units.empty()) {
-        fprintf(stderr, "单元表为空\n");
+        fprintf(stderr, "the unit list is empty\n");
         return 1;
     }
 
@@ -133,14 +134,14 @@ int main(int argc, char ** argv) {
     std::string err;
     qwen3_aligner * aligner = qwen3_aligner_init(params, err);
     if (!aligner) {
-        fprintf(stderr, "对齐器加载失败: %s\n", err.c_str());
+        fprintf(stderr, "failed to load the aligner: %s\n", err.c_str());
         llama_backend_free();
         return 1;
     }
 
     std::vector<unsigned char> raw;
     if (!read_file(audio_file, raw)) {
-        fprintf(stderr, "读不了音频文件: %s\n", audio_file.c_str());
+        fprintf(stderr, "cannot read the audio file: %s\n", audio_file.c_str());
         qwen3_aligner_free(aligner);
         llama_backend_free();
         return 1;
@@ -148,7 +149,7 @@ int main(int argc, char ** argv) {
 
     std::vector<float> pcm;
     if (!qwen3_aligner_decode_audio(aligner, raw.data(), raw.size(), pcm, err)) {
-        fprintf(stderr, "音频解码失败: %s\n", err.c_str());
+        fprintf(stderr, "failed to decode the audio: %s\n", err.c_str());
         qwen3_aligner_free(aligner);
         llama_backend_free();
         return 1;
@@ -156,7 +157,7 @@ int main(int argc, char ** argv) {
 
     std::vector<qwen3_aligner_span> spans;
     if (!qwen3_aligner_align(aligner, pcm.data(), pcm.size(), units, spans, err)) {
-        fprintf(stderr, "对齐失败: %s\n", err.c_str());
+        fprintf(stderr, "alignment failed: %s\n", err.c_str());
         qwen3_aligner_free(aligner);
         llama_backend_free();
         return 1;
@@ -171,7 +172,7 @@ int main(int argc, char ** argv) {
         }
         printf("]}\n");
     } else {
-        printf("时长 %.3fs, %zu 个单元\n", duration, spans.size());
+        printf("%.3fs, %zu units\n", duration, spans.size());
         for (const auto & s : spans) {
             printf("  %7.3f  %7.3f  %s\n", s.start, s.end, s.text.c_str());
         }
