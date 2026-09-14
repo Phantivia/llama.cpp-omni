@@ -18,6 +18,8 @@ on:
   push:
     tags:
       - 'tts-*'
+    branches:
+      - 'feat/forced-aligner'
 
 permissions:
   contents: write
@@ -50,7 +52,6 @@ jobs:
         with:
           cuda: ${{ matrix.cuda }}
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
 
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
