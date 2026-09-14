@@ -2,6 +2,7 @@
 // Adapted from server-omni.cpp pattern
 
 #include "voxcpm2_runtime.h"
+#include "qwen3-aligner.h"
 #include "llama.h"
 #include "common.h"
 #include "log.h"
@@ -173,6 +174,8 @@ static std::vector<float> voxcpm2_load_wav_from_memory(const std::vector<uint8_t
 
 struct voxcpm2_server_state {
     VoxCPM2Runtime * runtime = nullptr;
+    // 对齐器自带锁,不受 mutex 管;加载后只读
+    qwen3_aligner * aligner = nullptr;
     std::mutex mutex;
 };
 
@@ -217,13 +220,13 @@ int main(int argc, char ** argv) {
     // ── Health ────────────────────────────────────────────────────────────
 
     svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
-        json health = {{"status", "ok"}, {"engine", "voxcpm2"}};
+        json health = {{"status", "ok"}, {"engine", "voxcpm2"}, {"aligner", state.aligner != nullptr}};
         res.set_header("X-Engine", "voxcpm2");
         res_ok(res, health);
     });
 
     svr.Get("/v1/health", [&](const httplib::Request &, httplib::Response & res) {
-        json health = {{"status", "ok"}, {"engine", "voxcpm2"}};
+        json health = {{"status", "ok"}, {"engine", "voxcpm2"}, {"aligner", state.aligner != nullptr}};
         res.set_header("X-Engine", "voxcpm2");
         res_ok(res, health);
     });
@@ -489,6 +492,57 @@ int main(int argc, char ** argv) {
         res_ok(res, resp);
     });
 
+    // ── POST /v1/audio/align ──────────────────────────────────────────────
+    //
+    // 给一段音频和一串对齐单元,回每个单元的起止秒数。单元怎么切是调用方的事,
+    // 这里原样收下:中文逐字、英文逐词、或者任意别的粒度都行。
+
+    svr.Post("/v1/audio/align", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!state.aligner) {
+            res_error(res, format_error_response(
+                "aligner not loaded; start the server with --aligner-lm and --aligner-audio", "server_error"));
+            return;
+        }
+        json data = json::parse(req.body);
+
+        const std::string audio_b64 = json_value(data, "audio", std::string(""));
+        if (audio_b64.empty()) {
+            res_error(res, format_error_response("\"audio\" (base64) is required"));
+            return;
+        }
+        if (!data.contains("units") || !data["units"].is_array()) {
+            res_error(res, format_error_response("\"units\" must be an array of strings"));
+            return;
+        }
+        std::vector<std::string> units = data["units"].get<std::vector<std::string>>();
+
+        const raw_buffer  raw = base64_decode(audio_b64);
+        std::vector<float> pcm;
+        std::string        err;
+        if (!qwen3_aligner_decode_audio(state.aligner, raw.data(), raw.size(), pcm, err)) {
+            res_error(res, format_error_response(err));
+            return;
+        }
+
+        std::vector<qwen3_aligner_span> spans;
+        if (!qwen3_aligner_align(state.aligner, pcm.data(), pcm.size(), units, spans, err)) {
+            res_error(res, format_error_response(err, "server_error"));
+            return;
+        }
+
+        const int sr = qwen3_aligner_sample_rate(state.aligner);
+        json out_units = json::array();
+        for (const auto & s : spans) {
+            out_units.push_back({{"text", s.text}, {"start", s.start}, {"end", s.end}});
+        }
+        json resp = {
+            {"sample_rate", sr},
+            {"duration", (double) pcm.size() / sr},
+            {"units", out_units}
+        };
+        res_ok(res, resp);
+    });
+
     // ── Startup: load VoxCPM2 models ──────────────────────────────────────
 
     bool has_voxcpm2 = !params.voxcpm2_base_lm.empty() && !params.voxcpm2_acoustic.empty();
@@ -515,6 +569,27 @@ int main(int argc, char ** argv) {
         rt->set_n_threads(params.cpuparams.n_threads);
         state.runtime = rt;
         LOG_INF("VoxCPM2 loaded, sample_rate=%d\n", rt->sample_rate());
+    }
+
+    // ── Startup: load the aligner (optional) ──────────────────────────────
+
+    if (!params.aligner_lm.empty() && !params.aligner_audio.empty()) {
+        LOG_INF("Loading Qwen3-ForcedAligner...\n");
+        qwen3_aligner_params ap;
+        ap.lm_path      = params.aligner_lm;
+        ap.audio_path   = params.aligner_audio;
+        ap.n_gpu_layers = params.aligner_n_gpu_layers;
+        ap.n_threads    = params.cpuparams.n_threads;
+        ap.n_ctx        = params.aligner_n_ctx;
+
+        std::string err;
+        state.aligner = qwen3_aligner_init(ap, err);
+        if (!state.aligner) {
+            // TTS 本身还能用,对齐端点返回未加载即可,不拖垮整个 server
+            LOG_ERR("aligner init failed: %s\n", err.c_str());
+        } else {
+            LOG_INF("Aligner loaded\n");
+        }
     }
 
     // ── Bind and listen ───────────────────────────────────────────────────
@@ -591,6 +666,7 @@ int main(int argc, char ** argv) {
         state.runtime->free();
         delete state.runtime;
     }
+    qwen3_aligner_free(state.aligner);
 
     llama_backend_free();
     return 0;
