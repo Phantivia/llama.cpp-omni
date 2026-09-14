@@ -1,0 +1,150 @@
+# 发布 llama-tts-server / voxcpm2-cli / llama-aligner-cli 的二进制。
+#
+# 上游不发这些可执行文件,Cortico 的 vtuber World 需要一个能直接下载的运行时,
+# 所以在这个 fork 上自己出 release。资产命名照 ggml-org 的形状。
+#
+# Windows 的 CUDA 运行库不打包进来:装的人另下 ggml-org 同版本的
+# cudart-llama-bin-win-cuda-<版本>-x64.zip,与 Cortico 的 llamacpp provider 共用一份。
+
+name: Cortico release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布 tag(形如 tts-b64d092c-1);留空只构建不发布'
+        required: false
+        type: string
+  push:
+    tags:
+      - 'tts-*'
+
+permissions:
+  contents: write
+
+env:
+  CMAKE_COMMON: >-
+    -DCMAKE_BUILD_TYPE=Release
+    -DGGML_NATIVE=OFF
+    -DLLAMA_BUILD_SERVER=ON
+    -DLLAMA_BUILD_TESTS=OFF
+    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_TOOLS=ON
+    -DLLAMA_CURL=OFF
+  TARGETS: llama-tts-server voxcpm2-cli llama-aligner-cli
+
+jobs:
+  windows-cuda:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: '13.3.0'
+            key: win-cuda-13.3-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 CUDA
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.key }}
+          evict-old-files: 1d
+
+      - name: 配置
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          cmake -B build -S . -G Ninja ${{ env.CMAKE_COMMON }} ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;120-real;120-virtual" ^
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: 构建
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          cmake --build build --target ${{ env.TARGETS }} -j %NUMBER_OF_PROCESSORS%
+
+      - name: 打包
+        shell: pwsh
+        run: |
+          $out = "llama-tts-server-${{ matrix.key }}"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item build\bin\*.exe $out -ErrorAction SilentlyContinue
+          Copy-Item build\bin\*.dll $out -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$out\*" -DestinationPath "$out.zip"
+          (Get-FileHash "$out.zip" -Algorithm SHA256).Hash.ToLower() + "  $out.zip" |
+            Out-File -Encoding ascii "$out.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.key }}
+          path: |
+            llama-tts-server-${{ matrix.key }}.zip
+            llama-tts-server-${{ matrix.key }}.zip.sha256
+
+  ubuntu-cuda:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.6.2-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 依赖
+        run: |
+          apt-get update
+          apt-get install -y build-essential cmake ninja-build git ccache
+
+      - name: 配置与构建
+        run: |
+          cmake -B build -S . -G Ninja ${{ env.CMAKE_COMMON }} \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;120-real;120-virtual" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          cmake --build build --target ${{ env.TARGETS }} -j $(nproc)
+
+      - name: 打包
+        run: |
+          out=llama-tts-server-ubuntu-cuda-12.6-x64
+          mkdir -p $out
+          cp build/bin/llama-tts-server build/bin/voxcpm2-cli build/bin/llama-aligner-cli $out/ 2>/dev/null || true
+          cp build/bin/*.so $out/ 2>/dev/null || true
+          tar -czf $out.tar.gz $out
+          sha256sum $out.tar.gz > $out.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-cuda-12.6-x64
+          path: |
+            llama-tts-server-ubuntu-cuda-12.6-x64.tar.gz
+            llama-tts-server-ubuntu-cuda-12.6-x64.tar.gz.sha256
+
+  release:
+    needs: [windows-cuda, ubuntu-cuda]
+    if: startsWith(github.ref, 'refs/tags/tts-') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: assets/*
+          fail_on_unmatched_files: true
+          body: |
+            `llama-tts-server`(VoxCPM2 + Qwen3-ForcedAligner)、`voxcpm2-cli`、`llama-aligner-cli`
+            的二进制,供 [Cortico](https://github.com/Pal-AI-Lab/Cortico) 的 vtuber World 下载使用。
+
+            Windows CUDA 版不含 CUDA 运行库,另下 ggml-org 同版本的
+            `cudart-llama-bin-win-cuda-13.3-x64.zip`。
+
+            权重不在这里,见 README。
