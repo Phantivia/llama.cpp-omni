@@ -104,8 +104,10 @@ jobs:
 
       - name: 配置与构建
         run: |
+          # 容器里没有真驱动,libcuda 只有 stub;不指出来 ggml-cuda 链接时找不到 cuGetErrorString
           cmake -B build -S . -G Ninja ${{ env.CMAKE_COMMON }} \
             -DGGML_CUDA=ON \
+            -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;120-real;120-virtual" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
           cmake --build build --target ${{ env.TARGETS }} -j $(nproc)
