@@ -18,8 +18,6 @@ on:
   push:
     tags:
       - 'tts-*'
-    branches:
-      - 'feat/forced-aligner'
 
 permissions:
   contents: write
@@ -78,8 +76,12 @@ jobs:
         run: |
           $out = "llama-tts-server-${{ matrix.key }}"
           New-Item -ItemType Directory -Force $out | Out-Null
-          Copy-Item build\bin\*.exe $out -ErrorAction SilentlyContinue
-          Copy-Item build\bin\*.dll $out -ErrorAction SilentlyContinue
+          Copy-Item build\bin\*.exe $out
+          Copy-Item build\bin\*.dll $out
+          Copy-Item LICENSE $out
+          foreach ($exe in 'llama-tts-server.exe', 'voxcpm2-cli.exe', 'llama-aligner-cli.exe') {
+            if (-not (Test-Path (Join-Path $out $exe))) { throw "$exe 没构建出来" }
+          }
           Compress-Archive -Path "$out\*" -DestinationPath "$out.zip"
           (Get-FileHash "$out.zip" -Algorithm SHA256).Hash.ToLower() + "  $out.zip" |
             Out-File -Encoding ascii "$out.zip.sha256"
@@ -104,10 +106,18 @@ jobs:
 
       - name: 配置与构建
         run: |
-          # 容器里没有真驱动,libcuda 只有 stub;不指出来 ggml-cuda 链接时找不到 cuGetErrorString
+          # 容器里没有真驱动,libcuda 只有 stub。ggml-cuda 自己靠 CMAKE_LIBRARY_PATH 链到 stub,
+          # 可执行文件再链过去时 ld 要拿 libcuda.so.1 核对符号,拿不到就报一串
+          # undefined reference to cuMemCreate;--allow-shlib-undefined 放行,
+          # 上游 build-cuda-ubuntu.yml 在同一个容器里也是这么绕的。
+          # 产物还要从 build/bin 打包搬到别人机器上,CMake 默认写进去的构建树 rpath 到那边
+          # 不存在,换成 $ORIGIN。
           cmake -B build -S . -G Ninja ${{ env.CMAKE_COMMON }} \
             -DGGML_CUDA=ON \
             -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;120-real;120-virtual" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
           cmake --build build --target ${{ env.TARGETS }} -j $(nproc)
@@ -116,10 +126,23 @@ jobs:
         run: |
           out=llama-tts-server-ubuntu-cuda-12.8-x64
           mkdir -p $out
-          cp build/bin/llama-tts-server build/bin/voxcpm2-cli build/bin/llama-aligner-cli $out/ 2>/dev/null || true
-          cp build/bin/*.so $out/ 2>/dev/null || true
+          cp build/bin/llama-tts-server build/bin/voxcpm2-cli build/bin/llama-aligner-cli $out/
+          # -a 保留 libmtmd.so.0 这类软链:SONAME 是带版本号的那个名字,只拷 *.so 装上就少一个
+          cp -a build/bin/*.so* $out/
+          cp LICENSE $out/
           tar -czf $out.tar.gz $out
           sha256sum $out.tar.gz > $out.tar.gz.sha256
+
+      - name: 校验
+        run: |
+          out=llama-tts-server-ubuntu-cuda-12.8-x64
+          tar -xzf $out.tar.gz -C /tmp
+          cd /tmp/$out
+          # libcuda.so.1 来自显卡驱动,容器里只有 stub,不算缺;别的要么在包里,要么是 CUDA 运行库
+          for exe in llama-tts-server voxcpm2-cli llama-aligner-cli; do
+            missing=$(ldd ./$exe | grep 'not found' | grep -v libcuda.so.1 || true)
+            if [ -n "$missing" ]; then echo "$exe 少了:"; echo "$missing"; exit 1; fi
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -149,5 +172,6 @@ jobs:
 
             Windows CUDA 版不含 CUDA 运行库,另下 ggml-org 同版本的
             `cudart-llama-bin-win-cuda-13.3-x64.zip`。
+            Ubuntu CUDA 版同理,要本机装了 CUDA 12.x 运行库(`libcudart.so.12`、`libcublas.so.12`)。
 
             权重不在这里,见 README。
