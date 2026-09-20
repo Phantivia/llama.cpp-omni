@@ -228,6 +228,23 @@ struct VoxCPM2Runtime {
         void free_graph();
     } cached_front_half;
 
+    // Single-entry content-keyed cache. One voice is reused for many sentences, so the same
+    // reference bytes arrive on every request; a different reference simply misses.
+    struct ReferenceCache {
+        uint64_t           key   = 0;
+        bool               valid = false;
+        std::vector<float> value;
+    };
+
+    // AudioVAE encode of the reference audio; key is the decoded samples + sample rate.
+    // Without it the resample, the encode and its per-call graph allocation repeat per request.
+    ReferenceCache reference_feat_cache;
+
+    // enc_to_lm(LocEnc(reference patches)); key is the patch values in feat-position order.
+    // LocEnc runs per patch and enc_to_lm is a per-position projection, so these rows do not
+    // depend on the surrounding text or on the patch's sequence position.
+    ReferenceCache reference_embed_cache;
+
     bool fail(const std::string & message);
     void clear_error();
 

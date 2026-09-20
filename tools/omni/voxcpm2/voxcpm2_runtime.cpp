@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -35,6 +37,24 @@ constexpr size_t kLargeGraphMem  = 512ull * 1024ull * 1024ull;  // CFM 10-step /
 constexpr size_t kSmallGraphNodes  = 8192;    // simple projections
 constexpr size_t kMediumGraphNodes = 65536;   // 8-layer transformer / FSQ
 constexpr size_t kLargeGraphNodes  = 262144;  // 10-step CFM (4462 nodes observed) + AudioVAE
+
+// 64-bit FNV-1a, used only as a cache key: equal bytes must give equal keys, and a
+// collision would silently reuse another reference's features.
+constexpr uint64_t kHashInit = 1469598103934665603ull;
+
+uint64_t hash_bytes(uint64_t h, const void * data, size_t size) {
+    const uint8_t * p = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        h = (h ^ static_cast<uint64_t>(p[i])) * 1099511628211ull;
+    }
+    return h;
+}
+
+// Stage timings are printed only when VOXCPM2_PROFILE is set.
+bool profile_enabled() {
+    static const bool enabled = std::getenv("VOXCPM2_PROFILE") != nullptr;
+    return enabled;
+}
 
 struct GgmlContextGuard {
     ggml_context * ctx = nullptr;
@@ -857,24 +877,63 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
                     combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
     }
 
-    std::vector<float> feat_embed(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
+    const bool profile = profile_enabled();
+
     if (has_feat) {
-        std::vector<float> loc_hidden = run_locenc_sequence(inputs.audio_feat, seq_len);
-        if (loc_hidden.empty()) {
-            return fail("LocEnc sequence forward failed");
-        }
-        feat_embed = run_enc_to_lm(loc_hidden, seq_len);
-        if (feat_embed.empty()) {
-            return fail("enc_to_lm projection failed");
+        // LocEnc runs per patch and enc_to_lm is a per-position projection, so the rows at
+        // feat positions depend only on their own patch. Compute them over the packed patch
+        // list instead of the full sequence (same values, no work on the zero patches of the
+        // text positions) and reuse them when the same reference patches come back.
+        int n_feat = 0;
+        for (int i = 0; i < seq_len; ++i) {
+            n_feat += feat_mask[static_cast<size_t>(i)] != 0 ? 1 : 0;
         }
 
+        std::vector<float> ref_patches(static_cast<size_t>(patch_elems) * static_cast<size_t>(n_feat));
+        int                row = 0;
         for (int i = 0; i < seq_len; ++i) {
             if (feat_mask[static_cast<size_t>(i)] == 0) {
                 continue;
             }
-            std::copy_n(feat_embed.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden),
+            std::copy_n(inputs.audio_feat.data() + static_cast<size_t>(i) * static_cast<size_t>(patch_elems),
+                        static_cast<size_t>(patch_elems),
+                        ref_patches.data() + static_cast<size_t>(row) * static_cast<size_t>(patch_elems));
+            ++row;
+        }
+
+        const int64_t  t_embed = profile ? ggml_time_us() : 0;
+        const uint64_t ref_key = hash_bytes(kHashInit, ref_patches.data(), ref_patches.size() * sizeof(float));
+        const bool     hit     = reference_embed_cache.valid && reference_embed_cache.key == ref_key;
+        if (!hit) {
+            reference_embed_cache.valid = false;
+            std::vector<float> loc_hidden = run_locenc_sequence(ref_patches, n_feat);
+            if (loc_hidden.empty()) {
+                return fail("LocEnc sequence forward failed");
+            }
+            reference_embed_cache.value = run_enc_to_lm(loc_hidden, n_feat);
+            if (reference_embed_cache.value.empty()) {
+                return fail("enc_to_lm projection failed");
+            }
+            reference_embed_cache.key   = ref_key;
+            reference_embed_cache.valid = true;
+        }
+        if (reference_embed_cache.value.size() != static_cast<size_t>(hidden) * static_cast<size_t>(n_feat)) {
+            return fail("reference embedding cache size mismatch");
+        }
+
+        row = 0;
+        for (int i = 0; i < seq_len; ++i) {
+            if (feat_mask[static_cast<size_t>(i)] == 0) {
+                continue;
+            }
+            std::copy_n(reference_embed_cache.value.data() + static_cast<size_t>(row) * static_cast<size_t>(hidden),
                         static_cast<size_t>(hidden),
                         combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
+            ++row;
+        }
+        if (profile) {
+            LOG_INF("profile: reference embed %s %.1f ms (%d patches)\n", hit ? "hit" : "miss",
+                    (ggml_time_us() - t_embed) / 1000.0, n_feat);
         }
     }
 
@@ -1469,8 +1528,22 @@ std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<floa
         return {};
     }
 
-    const int          actual_sample_rate = sample_rate > 0 ? sample_rate : audio_vae.config.sample_rate;
+    const int  actual_sample_rate = sample_rate > 0 ? sample_rate : audio_vae.config.sample_rate;
+    const bool profile            = profile_enabled();
+
+    const uint64_t ref_key = hash_bytes(hash_bytes(kHashInit, &actual_sample_rate, sizeof(actual_sample_rate)),
+                                        reference_wav.data(), reference_wav.size() * sizeof(float));
+    if (reference_feat_cache.valid && reference_feat_cache.key == ref_key) {
+        if (profile) {
+            LOG_INF("profile: reference encode hit (%.2f s audio)\n",
+                    static_cast<double>(reference_wav.size()) / actual_sample_rate);
+        }
+        return reference_feat_cache.value;
+    }
+
+    const int64_t      t_resample = profile ? ggml_time_us() : 0;
     std::vector<float> audio = resample_mono_linear(reference_wav, actual_sample_rate, audio_vae.config.sample_rate);
+    const int64_t      t_vae = profile ? ggml_time_us() : 0;
     const int          audio_patch_len = patch_size() * audio_vae.config.hop_length();
     if (audio_patch_len <= 0) {
         fail("invalid AudioVAE hop length or patch size");
@@ -1532,9 +1605,20 @@ std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<floa
         return {};
     }
 
-    auto result = tensor_to_vector(patch_major);
+    reference_feat_cache.value = tensor_to_vector(patch_major);
     ggml_gallocr_free(galloc);
-    return result;
+
+    if (profile) {
+        const int64_t t_end = ggml_time_us();
+        LOG_INF("profile: reference encode miss resample=%.1f vae=%.1f total=%.1f ms (%.2f s audio, %d patches)\n",
+                (t_vae - t_resample) / 1000.0, (t_end - t_vae) / 1000.0, (t_end - t_resample) / 1000.0,
+                static_cast<double>(reference_wav.size()) / actual_sample_rate,
+                total_latent_frames / patch_size());
+    }
+
+    reference_feat_cache.key   = ref_key;
+    reference_feat_cache.valid = true;
+    return reference_feat_cache.value;
 }
 
 std::vector<int32_t> VoxCPM2Runtime::expand_multichar_cjk_tokens(const std::vector<int32_t> & ids) const {
