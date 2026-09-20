@@ -880,13 +880,32 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
     const bool profile = profile_enabled();
 
     if (has_feat) {
-        // LocEnc runs per patch and enc_to_lm is a per-position projection, so the rows at
-        // feat positions depend only on their own patch. Compute them over the packed patch
-        // list instead of the full sequence (same values, no work on the zero patches of the
-        // text positions) and reuse them when the same reference patches come back.
-        int n_feat = 0;
+        // LocEnc runs per patch, so a feat row depends only on its own patch and the reference
+        // rows can be computed once over the packed patch list and reused. enc_to_lm is kept on
+        // the full sequence: it is a single sub-millisecond projection, but running it at a
+        // narrower batch width picks a different ggml matmul path, and on CUDA that moved rows
+        // by up to 9e-2 against a mean magnitude of 8e-1 - enough to flip a stop decision.
+        const int lh     = loc_enc.config.transformer.hidden_size;
+        int       n_feat = 0;
         for (int i = 0; i < seq_len; ++i) {
             n_feat += feat_mask[static_cast<size_t>(i)] != 0 ? 1 : 0;
+        }
+
+        // The callers put a zero patch on every text position. Reuse a single LocEnc row for all
+        // of them, and fall back to the full-sequence forward if a caller ever puts real feats
+        // there, since one cached row would then stand for patches that differ.
+        bool text_patches_zero = true;
+        for (int i = 0; i < seq_len && text_patches_zero; ++i) {
+            if (feat_mask[static_cast<size_t>(i)] != 0) {
+                continue;
+            }
+            const float * patch = inputs.audio_feat.data() + static_cast<size_t>(i) * static_cast<size_t>(patch_elems);
+            for (int j = 0; j < patch_elems; ++j) {
+                if (patch[j] != 0.0f) {
+                    text_patches_zero = false;
+                    break;
+                }
+            }
         }
 
         std::vector<float> ref_patches(static_cast<size_t>(patch_elems) * static_cast<size_t>(n_feat));
@@ -903,37 +922,66 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
 
         const int64_t  t_embed = profile ? ggml_time_us() : 0;
         const uint64_t ref_key = hash_bytes(kHashInit, ref_patches.data(), ref_patches.size() * sizeof(float));
-        const bool     hit     = reference_embed_cache.valid && reference_embed_cache.key == ref_key;
-        if (!hit) {
-            reference_embed_cache.valid = false;
-            std::vector<float> loc_hidden = run_locenc_sequence(ref_patches, n_feat);
-            if (loc_hidden.empty()) {
+        const bool     hit     = text_patches_zero && reference_locenc_cache.valid &&
+                             reference_locenc_cache.key == ref_key &&
+                             reference_locenc_cache.value.size() == static_cast<size_t>(lh) * static_cast<size_t>(n_feat) &&
+                             zero_patch_locenc.size() == static_cast<size_t>(lh);
+
+        std::vector<float> loc_hidden;
+        if (hit) {
+            loc_hidden.resize(static_cast<size_t>(lh) * static_cast<size_t>(seq_len));
+            row = 0;
+            for (int i = 0; i < seq_len; ++i) {
+                const float * src = feat_mask[static_cast<size_t>(i)] != 0
+                                        ? reference_locenc_cache.value.data() + static_cast<size_t>(row++) * static_cast<size_t>(lh)
+                                        : zero_patch_locenc.data();
+                std::copy_n(src, static_cast<size_t>(lh), loc_hidden.data() + static_cast<size_t>(i) * static_cast<size_t>(lh));
+            }
+        } else {
+            loc_hidden = run_locenc_sequence(inputs.audio_feat, seq_len);
+            if (loc_hidden.size() != static_cast<size_t>(lh) * static_cast<size_t>(seq_len)) {
                 return fail("LocEnc sequence forward failed");
             }
-            reference_embed_cache.value = run_enc_to_lm(loc_hidden, n_feat);
-            if (reference_embed_cache.value.empty()) {
-                return fail("enc_to_lm projection failed");
+            reference_locenc_cache.valid = false;
+            if (text_patches_zero) {
+                // Both halves come out of this same forward, so what is cached is exactly what the
+                // full-sequence path produced.
+                reference_locenc_cache.value.resize(static_cast<size_t>(lh) * static_cast<size_t>(n_feat));
+                row = 0;
+                bool have_zero_row = false;
+                for (int i = 0; i < seq_len; ++i) {
+                    const float * src = loc_hidden.data() + static_cast<size_t>(i) * static_cast<size_t>(lh);
+                    if (feat_mask[static_cast<size_t>(i)] != 0) {
+                        std::copy_n(src, static_cast<size_t>(lh),
+                                    reference_locenc_cache.value.data() + static_cast<size_t>(row++) * static_cast<size_t>(lh));
+                    } else if (!have_zero_row) {
+                        zero_patch_locenc.assign(src, src + lh);
+                        have_zero_row = true;
+                    }
+                }
+                if (have_zero_row) {
+                    reference_locenc_cache.key   = ref_key;
+                    reference_locenc_cache.valid = true;
+                }
             }
-            reference_embed_cache.key   = ref_key;
-            reference_embed_cache.valid = true;
-        }
-        if (reference_embed_cache.value.size() != static_cast<size_t>(hidden) * static_cast<size_t>(n_feat)) {
-            return fail("reference embedding cache size mismatch");
         }
 
-        row = 0;
+        std::vector<float> feat_embed = run_enc_to_lm(loc_hidden, seq_len);
+        if (feat_embed.size() != static_cast<size_t>(hidden) * static_cast<size_t>(seq_len)) {
+            return fail("enc_to_lm projection failed");
+        }
+
         for (int i = 0; i < seq_len; ++i) {
             if (feat_mask[static_cast<size_t>(i)] == 0) {
                 continue;
             }
-            std::copy_n(reference_embed_cache.value.data() + static_cast<size_t>(row) * static_cast<size_t>(hidden),
+            std::copy_n(feat_embed.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden),
                         static_cast<size_t>(hidden),
                         combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
-            ++row;
         }
         if (profile) {
-            LOG_INF("profile: reference embed %s %.1f ms (%d patches)\n", hit ? "hit" : "miss",
-                    (ggml_time_us() - t_embed) / 1000.0, n_feat);
+            LOG_INF("profile: reference embed %s %.1f ms (%d patches, %d positions)\n", hit ? "hit" : "miss",
+                    (ggml_time_us() - t_embed) / 1000.0, n_feat, seq_len);
         }
     }
 
@@ -2099,8 +2147,9 @@ void VoxCPM2Runtime::free() {
     reset_state();
     // Keyed by content only: the caches must go with the weights, or a re-init with a
     // different model would serve features computed under the old one.
-    reference_feat_cache  = {};
-    reference_embed_cache = {};
+    reference_feat_cache   = {};
+    reference_locenc_cache = {};
+    zero_patch_locenc.clear();
     audio_vae.free();
     stop_predictor.free();
     projections.free();

@@ -240,10 +240,15 @@ struct VoxCPM2Runtime {
     // Without it the resample, the encode and its per-call graph allocation repeat per request.
     ReferenceCache reference_feat_cache;
 
-    // enc_to_lm(LocEnc(reference patches)); key is the patch values in feat-position order.
-    // LocEnc runs per patch and enc_to_lm is a per-position projection, so these rows do not
-    // depend on the surrounding text or on the patch's sequence position.
-    ReferenceCache reference_embed_cache;
+    // LocEnc rows for the reference patches; key is the patch values in feat-position order.
+    // LocEnc runs per patch, so these rows do not depend on the surrounding text or on the
+    // patch's sequence position. enc_to_lm is deliberately left out: it is sub-millisecond and
+    // its result depends on the batch width it is run at.
+    ReferenceCache reference_locenc_cache;
+
+    // LocEnc row for the zero patch the callers put on every text position, filled from the same
+    // forward that filled reference_locenc_cache so the rebuilt sequence matches it exactly.
+    std::vector<float> zero_patch_locenc;
 
     bool fail(const std::string & message);
     void clear_error();
