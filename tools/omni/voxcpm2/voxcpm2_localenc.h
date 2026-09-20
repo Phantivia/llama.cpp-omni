@@ -46,6 +46,9 @@ struct LocEncModel {
 
     // input: [feat_dim, patch_size, seq_len] or [hidden_size, patch_size, seq_len]
     // output: [hidden_size, seq_len]
+    // Must stay strictly per-patch (no cross-patch context): VoxCPM2Runtime keys its
+    // reference caches by packed patch content and relies on each output row depending
+    // only on its own patch.
     ggml_tensor * forward_sequence(ggml_context * ctx, ggml_tensor * input) const;
 
     void free();

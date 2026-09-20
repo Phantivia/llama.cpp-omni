@@ -2097,6 +2097,10 @@ bool VoxCPM2Runtime::generate_with_continuation_streaming(const std::string &   
 void VoxCPM2Runtime::free() {
     cached_front_half.free_graph();
     reset_state();
+    // Keyed by content only: the caches must go with the weights, or a re-init with a
+    // different model would serve features computed under the old one.
+    reference_feat_cache  = {};
+    reference_embed_cache = {};
     audio_vae.free();
     stop_predictor.free();
     projections.free();
