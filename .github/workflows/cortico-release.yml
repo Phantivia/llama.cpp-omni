@@ -23,6 +23,10 @@ permissions:
   contents: write
 
 env:
+  # LLAMA_OPENSSL 默认 ON,而 windows runner 自带 OpenSSL 3.6.4:找得到就给 server
+  # 打上 CPPHTTPLIB_OPENSSL_SUPPORT,二进制多出 libssl-3-x64.dll / libcrypto-3-x64.dll
+  # 两条不随包分发的依赖(tts-b64d092c-2 的 Windows 包因此在别人机器上直接 0xC0000135)。
+  # World 只走回环明文 HTTP,不需要 HTTPS,两个平台一律关掉。
   CMAKE_COMMON: >-
     -DCMAKE_BUILD_TYPE=Release
     -DGGML_NATIVE=OFF
@@ -31,6 +35,7 @@ env:
     -DLLAMA_BUILD_EXAMPLES=OFF
     -DLLAMA_BUILD_TOOLS=ON
     -DLLAMA_CURL=OFF
+    -DLLAMA_OPENSSL=OFF
   TARGETS: llama-tts-server voxcpm2-cli llama-aligner-cli
 
 jobs:
